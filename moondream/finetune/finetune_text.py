@@ -1,11 +1,12 @@
+import json
+import os
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 import math
 from safetensors.torch import save_file
-
+from PIL import Image
 from tqdm import tqdm
-from datasets import load_dataset
 from bitsandbytes.optim import AdamW8bit
 import wandb
 
@@ -15,12 +16,24 @@ from ..torch.text import _produce_hidden, _lm_head, TextConfig
 
 # This is a intended to be a basic starting point for fine-tuning the text encoder.
 # Your optimal hyperparams and data may be different.
-MODEL_PATH = ""
+MODEL_PATH = "/home/felix/tools/moondream2/models/moondream_text_finetuned4.safetensors"
 # Your data should end with the eos token. Here is the textual representation.
 ANSWER_EOS = "<|endoftext|>"
 LR = 3e-6
-EPOCHS = 3
-GRAD_ACCUM_STEPS = 128
+EPOCHS = 100
+GRAD_ACCUM_STEPS = 35
+
+# Remember to update the paths
+# python -m moondream.torch.sample --model /home/felix/tools/moondream2/models/moondream_base.safetensors --image "/home/felix/datasets/caption_demo/images/472588635_18478233001041604_2374849079303917776_n.jpg" --prompt "\n\nQuestion: Describe this image.\n\nAnswer:"
+# python -m moondream.torch.sample --model /home/felix/tools/moondream2/models/moondream_text_finetuned.safetensors --image "/home/felix/datasets/caption_demo/images/472588635_18478233001041604_2374849079303917776_n.jpg" --prompt "\n\nQuestion: Describe this image.\n\nAnswer:"
+# python -m moondream.torch.sample --model /home/felix/tools/moondream2/models/moondream_text_finetuned.safetensors --image "/home/felix/datasets/caption_demo/images/ComfyUI_00135_.png" --prompt "\n\nQuestion: Describe this image.\n\nAnswer:"
+
+# Seems like the normal, long caption tokens are this respectively:
+# ĊĊCaption:
+# Ecscaped: \n\nCaption:
+
+# ĊĊShortĠcaption:
+# Escaped: \n\nShort caption:
 
 
 def lr_schedule(step, max_steps):
@@ -51,22 +64,50 @@ def text_loss(
     return loss
 
 
-class DocciDataset(Dataset):
-    def __init__(self, split="train"):
-        self.data = load_dataset("google/docci", trust_remote_code=True)[split]
+class Dataset(Dataset):
+    def __init__(self, json_file, image_dir, split="train"):
+        """
+        Args:
+            json_file (str): Path to the custom JSON file.
+            image_dir (str): Directory containing the images.
+            split (str): Dataset split (e.g., "train"). Not used in this implementation
+                         but kept for compatibility.
+        """
+        self.image_dir = image_dir
+        with open(json_file, "r") as f:
+            self.data = json.load(f)  # Load the entire JSON file
+
+        # Convert the dictionary to a list of items for easier indexing
+        self.data_list = list(self.data.items())
+
+        print(f"Initiated dataset with {len(self.data_list)} samples.")
 
     def __len__(self):
-        return len(self.data)
+        return len(self.data_list)
 
     def __getitem__(self, idx):
-        sample = self.data[idx]
-        description = sample["description"]
+        """
+        Returns a dictionary containing the image and a QA pair.
+        """
+        key, sample = self.data_list[idx]
+
+        # Load the image
+        image_path = os.path.join(self.image_dir, sample["filename"])
+        image = Image.open(image_path).convert("RGB")
+
+        # Extract the caption and critical concepts
+        description = sample["file_attributes"]["caption"]
+        critical_concepts = sample["file_attributes"]["critical_concepts"]
+
+        # Format the QA pair
+        qa = {
+            "question": "\n\nQuestion: Describe this image.\n\nAnswer:",
+            "answer": f"{description}{ANSWER_EOS}",
+        }
+
         return {
-            "image": sample["image"],
-            "qa": {
-                "question": "\n\nQuestion: Describe this image.\n\nAnswer:",
-                "answer": f"{description}{ANSWER_EOS}",
-            },
+            "image": image,
+            "qa": qa,
         }
 
 
@@ -98,7 +139,12 @@ def main():
         eps=1e-6,
     )
 
-    dataset = DocciDataset("train")
+    json_file = "/home/felix/Downloads/scl-caption-tiny_json(1).json"
+    image_dir = "/home/felix/datasets/SCL-caption-tiny/images"
+
+    dataset = Dataset(json_file, image_dir)
+
+    print(f"ds len: {len(dataset)}")
 
     total_steps = EPOCHS * len(dataset) // GRAD_ACCUM_STEPS
     pbar = tqdm(total=total_steps)
@@ -144,6 +190,7 @@ def main():
                     param_group["lr"] = lr
                 pbar.set_postfix({"step": i // GRAD_ACCUM_STEPS, "loss": loss.item()})
                 pbar.update(1)
+                print(f"loss/train: {loss.item()}")
                 wandb.log(
                     {"loss/train": loss.item(), "lr": optimizer.param_groups[0]["lr"]}
                 )
@@ -151,7 +198,7 @@ def main():
     # Add save path: ex. home/model.safetensors
     save_file(
         model.state_dict(),
-        "moondream_finetune.safetensors",
+        "models/moondream_text_finetuned.safetensors",
     )
 
 

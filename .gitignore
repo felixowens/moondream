@@ -8,3 +8,6 @@ dist
 clients/python/moondream/torch
 .vscode/launch.json
 wandb
+models
+detect.jpg
+point.jpg
