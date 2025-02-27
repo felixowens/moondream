@@ -370,19 +370,6 @@ def train_model(config: TrainingConfig) -> None:
         "image_dir": config.image_dir,
     }
 
-    # Initialize model
-    model_config = MoondreamConfig()
-    model = MoondreamModel(model_config)
-    load_weights_into_model(config.model_path, model)
-
-    # Set up optimizer
-    optimizer = AdamW8bit(
-        [{"params": model.text.parameters()}],
-        lr=config.learning_rate,
-        betas=(0.9, 0.95),
-        eps=1e-6,
-    )
-
     # Set up dataset
     full_dataset = ImageTextDataset(
         config.dataset_json, config.image_dir, config.answer_eos
@@ -431,6 +418,57 @@ def train_model(config: TrainingConfig) -> None:
     epoch_loss = 0.0
     samples_in_epoch = 0
 
+    # Initialize model
+    model_config = MoondreamConfig()
+    model = MoondreamModel(model_config)
+    load_weights_into_model(config.model_path, model)
+
+    # Pre-compute and cache embeddings for all samples
+    print("Pre-computing embeddings for all samples...")
+    cached_embeddings = {}
+    with torch.no_grad():
+        for idx in tqdm(range(len(full_dataset)), desc="Caching Embeddings"):
+            sample = full_dataset[idx]
+            sample_id = idx  # Use index as a unique identifier
+
+            # Cache image embeddings
+            img_emb = model._run_vision_encoder(sample["image"])
+
+            # Cache text embeddings
+            question_tokens = model.tokenizer.encode(sample["qa"]["question"]).ids
+            question_emb = text_encoder(
+                torch.tensor([[question_tokens]], device=model.device),
+                model.text,
+            ).squeeze(0)
+
+            answer_tokens = model.tokenizer.encode(sample["qa"]["answer"]).ids
+            answer_emb = text_encoder(
+                torch.tensor([[answer_tokens]], device=model.device),
+                model.text,
+            ).squeeze(0)
+
+            bos_emb = text_encoder(
+                torch.tensor([[model.config.tokenizer.bos_id]], device=model.device),
+                model.text,
+            )
+
+            cached_embeddings[sample_id] = {
+                "img_emb": img_emb,
+                "question_emb": question_emb,
+                "question_tokens": question_tokens,
+                "answer_emb": answer_emb,
+                "answer_tokens": answer_tokens,
+                "bos_emb": bos_emb,
+            }
+
+    # Set up optimizer
+    optimizer = AdamW8bit(
+        [{"params": model.text.parameters()}],
+        lr=config.learning_rate,
+        betas=(0.9, 0.95),
+        eps=1e-6,
+    )
+
     # Training loop
     for epoch in range(1, config.epochs + 1):
         # Reset epoch metrics
@@ -448,30 +486,16 @@ def train_model(config: TrainingConfig) -> None:
         for idx in indices:
             step_count += 1
             sample = train_dataset[idx]
+            sample_id = train_dataset.indices[
+                indices.index(idx)
+            ]  # Get the original index
 
-            # TODO: pre-process image and text embeddings prior to training loop
-            # Process image
-            with torch.no_grad():
-                img_emb = model._run_vision_encoder(sample["image"])
-
-            # Process question and answer
-            bos_emb = text_encoder(
-                torch.tensor([[model.config.tokenizer.bos_id]], device=model.device),
-                model.text,
-            )
-
-            question_tokens = model.tokenizer.encode(sample["qa"]["question"]).ids
-            question_emb = text_encoder(
-                torch.tensor([[question_tokens]], device=model.device),
-                model.text,
-            ).squeeze(0)
-
-            answer_tokens = model.tokenizer.encode(sample["qa"]["answer"]).ids
-            answer_emb = text_encoder(
-                torch.tensor([[answer_tokens]], device=model.device),
-                model.text,
-            ).squeeze(0)
-
+            # Use cached embeddings instead of recomputing
+            img_emb = cached_embeddings[sample_id]["img_emb"]
+            question_emb = cached_embeddings[sample_id]["question_emb"]
+            answer_tokens = cached_embeddings[sample_id]["answer_tokens"]
+            answer_emb = cached_embeddings[sample_id]["answer_emb"]
+            bos_emb = cached_embeddings[sample_id]["bos_emb"]
             # Combine embeddings
             inputs_embeds = torch.cat(
                 [bos_emb, img_emb[None], question_emb, answer_emb], dim=1
