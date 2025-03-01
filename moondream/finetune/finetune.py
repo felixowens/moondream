@@ -1,9 +1,11 @@
+from contextlib import contextmanager
 import datetime
 import json
 import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Dict, Any, Optional, List, Tuple
 import random
 
@@ -16,10 +18,35 @@ from PIL import Image
 from tqdm import tqdm
 from bitsandbytes.optim import AdamW8bit
 from aim import Run
+from torch.utils.data import DataLoader
 
 from ..torch.weights import load_weights_into_model
 from ..torch.moondream import MoondreamModel, MoondreamConfig, text_encoder
 from ..torch.text import _produce_hidden, _lm_head, TextConfig
+
+
+profiling_stats = {}
+
+
+@contextmanager
+def profile(name):
+    start_time = time.time()
+    yield
+    elapsed_time = time.time() - start_time
+    if name not in profiling_stats:
+        profiling_stats[name] = []
+    profiling_stats[name].append(elapsed_time)
+
+
+def print_profiling_stats():
+    print("\n--- Profiling Statistics ---")
+    for operation, times in profiling_stats.items():
+        avg_time = sum(times) / len(times)
+        total_time = sum(times)
+        percent = total_time / sum([sum(t) for t in profiling_stats.values()]) * 100
+        print(
+            f"{operation}: {avg_time:.4f}s avg, {total_time:.2f}s total ({percent:.1f}%)"
+        )
 
 
 @dataclass
@@ -213,7 +240,7 @@ def evaluate_model(
     perplexity_sum = 0.0
 
     with torch.no_grad():
-        for i in tqdm(range(len(eval_dataset)), desc="Evaluating"):
+        for i in tqdm(range(len(eval_dataset)), desc="Evaluating"):  # type: ignore
             sample = eval_dataset[i]
 
             # Process image
@@ -259,8 +286,8 @@ def evaluate_model(
             perplexity = torch.exp(loss)
             perplexity_sum += perplexity.item()
 
-    avg_loss = total_loss / len(eval_dataset)
-    avg_perplexity = perplexity_sum / len(eval_dataset)
+    avg_loss = total_loss / len(eval_dataset)  # type: ignore
+    avg_perplexity = perplexity_sum / len(eval_dataset)  # type: ignore
 
     model.train()
 
@@ -395,6 +422,8 @@ def train_model(config: TrainingConfig) -> None:
     # Calculate total steps
     steps_per_epoch = len(train_dataset)
 
+    total_steps = config.epochs * steps_per_epoch // config.grad_accum_steps
+
     if len(train_dataset) % config.grad_accum_steps != 0:
         closest_factor = max(
             [
@@ -437,18 +466,18 @@ def train_model(config: TrainingConfig) -> None:
             # Cache text embeddings
             question_tokens = model.tokenizer.encode(sample["qa"]["question"]).ids
             question_emb = text_encoder(
-                torch.tensor([[question_tokens]], device=model.device),
+                torch.tensor([[question_tokens]], device=model.device),  # type: ignore
                 model.text,
             ).squeeze(0)
 
             answer_tokens = model.tokenizer.encode(sample["qa"]["answer"]).ids
             answer_emb = text_encoder(
-                torch.tensor([[answer_tokens]], device=model.device),
+                torch.tensor([[answer_tokens]], device=model.device),  # type: ignore
                 model.text,
             ).squeeze(0)
 
             bos_emb = text_encoder(
-                torch.tensor([[model.config.tokenizer.bos_id]], device=model.device),
+                torch.tensor([[model.config.tokenizer.bos_id]], device=model.device),  # type: ignore
                 model.text,
             )
 
@@ -469,6 +498,34 @@ def train_model(config: TrainingConfig) -> None:
         eps=1e-6,
     )
 
+    def custom_collate_fn(batch):
+        """
+        Custom collate function for DataLoader to handle PIL images
+        """
+        images = [item["image"] for item in batch]
+        qa_pairs = [item["qa"] for item in batch]
+
+        # Return as a dictionary with lists
+        return {
+            "image": images,  # List of PIL images
+            "qa": qa_pairs,  # List of qa pairs
+        }
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=1,  # Or larger if memory allows
+        shuffle=True,
+        num_workers=2,  # Use multiple workers for parallel loading
+        pin_memory=True,  # Faster transfer to GPU
+        prefetch_factor=2,  # Pre-fetch samples
+        generator=torch.Generator(device="cuda"),
+        collate_fn=custom_collate_fn,
+    )
+
+    # Calculate total steps based on DataLoader
+    steps_per_epoch = len(train_loader)
+    total_steps = config.epochs * steps_per_epoch
+
     # Training loop
     for epoch in range(1, config.epochs + 1):
         # Reset epoch metrics
@@ -476,86 +533,97 @@ def train_model(config: TrainingConfig) -> None:
         samples_in_epoch = 0
         start_time = torch.cuda.Event(enable_timing=True)
         end_time = torch.cuda.Event(enable_timing=True)
-        start_time.record()
+        start_time.record()  # type: ignore
 
-        # TODO: time this
         # Shuffle the training indices for each epoch
         indices = list(range(len(train_dataset)))
         random.shuffle(indices)
 
-        for idx in indices:
-            step_count += 1
-            sample = train_dataset[idx]
-            sample_id = train_dataset.indices[
-                indices.index(idx)
-            ]  # Get the original index
+        for batch_idx, batch in enumerate(train_loader):
+            with profile("get_sample"):
+                step_count += 1
+                sample = batch  # Get the original index
+                sample_id = train_dataset.indices[batch_idx]
 
-            # Use cached embeddings instead of recomputing
-            img_emb = cached_embeddings[sample_id]["img_emb"]
-            question_emb = cached_embeddings[sample_id]["question_emb"]
-            answer_tokens = cached_embeddings[sample_id]["answer_tokens"]
-            answer_emb = cached_embeddings[sample_id]["answer_emb"]
-            bos_emb = cached_embeddings[sample_id]["bos_emb"]
-            # Combine embeddings
-            inputs_embeds = torch.cat(
-                [bos_emb, img_emb[None], question_emb, answer_emb], dim=1
-            )
+            # TODO:
+            # For the cached embeddings, you'd need to adapt this approach
+            # You could either:
+            # 1. Access the original dataset index from your train_dataset
+            # 2. Modify your caching strategy to work with batches directly
 
-            # Calculate loss
-            loss = text_loss(
-                inputs_embeds=inputs_embeds,
-                w=model.text,
-                labels=torch.tensor([[answer_tokens]], device=model.device),
-                config=model_config.text,
-            )
-
-            # Track tokens processed
-            total_tokens += len(answer_tokens)
-
-            # Track loss for epoch calculation
-            epoch_loss += loss.item()
-            samples_in_epoch += 1
-
-            # Backpropagate
-            loss.backward()
-
-            # Update weights after accumulating gradients
-            if step_count % config.grad_accum_steps == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-
-                # Update learning rate
-                current_step = step_count // config.grad_accum_steps
-                lr = lr_schedule(current_step, total_steps, config)
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = lr
-
-                # Calculate perplexity (exponentiated loss)
-                perplexity = torch.exp(loss)
-
-                # Update progress bar
-                pbar.set_postfix(
-                    {
-                        "epoch": epoch,
-                        "step": current_step,
-                        "loss": loss.item(),
-                        "perplexity": perplexity.item(),
-                    }
+            with profile("get_cached_embeddings"):
+                # Use cached embeddings instead of recomputing
+                img_emb = cached_embeddings[sample_id]["img_emb"]
+                question_emb = cached_embeddings[sample_id]["question_emb"]
+                answer_tokens = cached_embeddings[sample_id]["answer_tokens"]
+                answer_emb = cached_embeddings[sample_id]["answer_emb"]
+                bos_emb = cached_embeddings[sample_id]["bos_emb"]
+                # Combine embeddings
+                inputs_embeds = torch.cat(
+                    [bos_emb, img_emb[None], question_emb, answer_emb], dim=1
                 )
-                pbar.update(1)
 
-                # Log metrics with Aim
-                aim_run.track(loss.item(), name="train/loss", step=current_step)
-                aim_run.track(
-                    perplexity.item(), name="train/perplexity", step=current_step
+            with profile("calculate_text_loss"):
+                # Calculate loss
+                loss = text_loss(
+                    inputs_embeds=inputs_embeds,
+                    w=model.text,
+                    labels=torch.tensor([[answer_tokens]], device=model.device),  # type: ignore
+                    config=model_config.text,
                 )
-                aim_run.track(lr, name="train/learning_rate", step=current_step)
-                aim_run.track(
-                    total_tokens, name="train/total_tokens", step=current_step
-                )
+
+            with profile("track_metrics"):
+                # Track tokens processed
+                total_tokens += len(answer_tokens)
+
+                # Track loss for epoch calculation
+                epoch_loss += loss.item()
+                samples_in_epoch += 1
+
+            with profile("backpropagate"):
+                # Backpropagate
+                loss.backward()
+
+            with profile("update_weights"):
+                # Update weights after accumulating gradients
+                if step_count % config.grad_accum_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                    # Update learning rate
+                    current_step = step_count // config.grad_accum_steps
+                    lr = lr_schedule(current_step, total_steps, config)
+                    for param_group in optimizer.param_groups:
+                        param_group["lr"] = lr
+
+                    # Calculate perplexity (exponentiated loss)
+                    perplexity = torch.exp(loss)
+
+                    # Update progress bar
+                    pbar.set_postfix(
+                        {
+                            "epoch": epoch,
+                            "step": current_step,
+                            "loss": loss.item(),
+                            "perplexity": perplexity.item(),
+                        }
+                    )
+                    pbar.update(1)
+
+                    # Log metrics with Aim
+                    aim_run.track(loss.item(), name="train/loss", step=current_step)
+                    aim_run.track(
+                        perplexity.item(),
+                        name="train/perplexity",
+                        step=current_step,
+                    )
+                    aim_run.track(lr, name="train/learning_rate", step=current_step)
+                    aim_run.track(
+                        total_tokens, name="train/total_tokens", step=current_step
+                    )
 
         # End of epoch
-        end_time.record()
+        end_time.record()  # type: ignore
         torch.cuda.synchronize()
         epoch_time_ms = start_time.elapsed_time(end_time)
         epoch_time_s = epoch_time_ms / 1000
@@ -575,6 +643,8 @@ def train_model(config: TrainingConfig) -> None:
         print(f"  Avg perplexity: {avg_epoch_perplexity:.4f}")
         print(f"  Tokens/second: {tokens_per_second:.2f}")
         print(f"  Epoch time: {epoch_time_s:.2f}s")
+
+        print_profiling_stats()
 
         # Run evaluation if needed
         if epoch % config.eval_frequency == 0:
@@ -606,7 +676,7 @@ def train_model(config: TrainingConfig) -> None:
 
     # Run final evaluation
     print("\nRunning final evaluation...")
-    final_metrics = evaluate_model(model, eval_dataset, device)
+    final_metrics = evaluate_model(model, eval_dataset, device, aim_run)
     for metric_name, metric_value in final_metrics.items():
         aim_run.track(metric_value, name=f"eval/{metric_name}", epoch=config.epochs)
         print(f"  {metric_name}: {metric_value:.4f}")
@@ -676,17 +746,17 @@ def main() -> None:
 
     # (to avoid conflicts with existing checkpoints) or handle conflicts gracefully.
     config = TrainingConfig(
-        model_path="/home/felix/tools/moondream2/models/moondream_text_finetuned_v1_a1_300.safetensors",
-        output_path="/home/felix/tools/moondream2/models/moondream_text_finetuned_v1_a1_400.safetensors",
-        dataset_json="/home/felix/Downloads/scl-caption-tiny_json(3).json",
-        image_dir="/home/felix/datasets/SCL-caption-tiny/images",
-        epochs=100,
-        grad_accum_steps=69,  # Should match the dataset size
+        model_path="/home/felix/tools/moondream2/models/moondream_base.safetensors",
+        output_path="/home/felix/tools/moondream2/models/moondream_base_finetuned_v1_a2_200.safetensors",
+        dataset_json="/home/felix/projects/dataset-tools/augment_caption_dataset/testing/dataset.json",
+        image_dir="/home/felix/projects/dataset-tools/augment_caption_dataset/testing",
+        epochs=200,
+        grad_accum_steps=246,  # Should match the dataset size
         eval_split=0.1,  # 10% of dataset for evaluation
         eval_frequency=5,  # Evaluate every 5 epochs
         save_frequency=25,  # Save every 10 epochs
         max_checkpoints=5,  # Keep only the last 3 checkpoints
-        # learning_rate=2e-5,
+        learning_rate=9e-6,
     )
 
     temp_dataset = ImageTextDataset(
