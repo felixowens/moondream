@@ -97,6 +97,7 @@ def lr_schedule(step: int, max_steps: int, config: TrainingConfig) -> float:
         The calculated learning rate for the current step
     """
     x = step / max_steps
+    print(f"x: {x} = {step} / {max_steps}")
 
     # Warmup phase (first 10% of training)
     if x < 0.1:
@@ -264,6 +265,7 @@ def evaluate_model(
                 model.text,
             ).squeeze(0)
 
+            # TODO: need to correct this to track the average length of the question and answer over the entire eval dataset so we can check over time
             aim_run.track(
                 len(question_tokens), name="eval/question_tokens_length", step=i
             )
@@ -524,7 +526,7 @@ def train_model(config: TrainingConfig) -> None:
 
     # Calculate total steps based on DataLoader
     steps_per_epoch = len(train_loader)
-    total_steps = config.epochs * steps_per_epoch
+    total_steps = config.epochs * steps_per_epoch // config.grad_accum_steps
 
     # Training loop
     for epoch in range(1, config.epochs + 1):
@@ -592,7 +594,12 @@ def train_model(config: TrainingConfig) -> None:
 
                     # Update learning rate
                     current_step = step_count // config.grad_accum_steps
+                    print(f"Current step: {current_step}")
+                    print(f"Total steps: {total_steps}")
+                    # TODO: check if lr schedule is bugged
+
                     lr = lr_schedule(current_step, total_steps, config)
+                    print(f"Learning rate: {lr}")
                     for param_group in optimizer.param_groups:
                         param_group["lr"] = lr
 
@@ -746,17 +753,17 @@ def main() -> None:
 
     # (to avoid conflicts with existing checkpoints) or handle conflicts gracefully.
     config = TrainingConfig(
-        model_path="/home/felix/tools/moondream2/models/moondream_base.safetensors",
-        output_path="/home/felix/tools/moondream2/models/moondream_base_finetuned_v1_a2_200.safetensors",
+        model_path="/home/felix/tools/moondream2/models/saved/moondream_base_finetuned_v1_a2_100.safetensors",
+        output_path="/home/felix/tools/moondream2/models/moondream_base_finetuned_v1_a2_150.safetensors",
         dataset_json="/home/felix/projects/dataset-tools/augment_caption_dataset/testing/dataset.json",
         image_dir="/home/felix/projects/dataset-tools/augment_caption_dataset/testing",
-        epochs=200,
+        epochs=50,
         grad_accum_steps=246,  # Should match the dataset size
         eval_split=0.1,  # 10% of dataset for evaluation
         eval_frequency=5,  # Evaluate every 5 epochs
         save_frequency=25,  # Save every 10 epochs
         max_checkpoints=5,  # Keep only the last 3 checkpoints
-        learning_rate=9e-6,
+        learning_rate=5e-6,
     )
 
     temp_dataset = ImageTextDataset(
